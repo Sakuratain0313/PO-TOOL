@@ -156,6 +156,7 @@ def extract_groups(ws, colmap, selected_destinations, data_start_row=3):
         price = g(r, 'price')
         if not qty or qty <= 0 or price is None:
             continue
+        price = round(price * 0.88, 4)
         f = g(r, 'factory_po')
         c = g(r, 'customer_po')
         if not f or not c:
@@ -189,7 +190,6 @@ STYLE_TOTAL_R = ParagraphStyle('totalr', fontName='Helvetica-Bold', fontSize=10.
 STYLE_BODY = ParagraphStyle('body', fontName='Helvetica', fontSize=10.5, alignment=TA_LEFT, leading=15)
 STYLE_VLINE = ParagraphStyle('vline', fontName='Helvetica', fontSize=9, alignment=TA_LEFT)
 STYLE_SIG_LABEL = ParagraphStyle('siglabel', fontName='Helvetica', fontSize=10, alignment=TA_LEFT, leading=13)
-STYLE_SIG_LINE = ParagraphStyle('sigline', fontName='Helvetica', fontSize=10, alignment=TA_LEFT)
 
 PAGE_W, PAGE_H = A4
 MARGIN_L = 16 * mm
@@ -319,16 +319,23 @@ def _build_item_story(groups_items):
         story.append(Paragraph(f'{i}. <b>{term}</b>', STYLE_BODY))
 
     story.append(PageBreak())
-    sig_left = [Spacer(1, 34), Paragraph('_' * 46, STYLE_SIG_LINE), Spacer(1, 2),
-                Paragraph('ACCEPTED BY (SUPPLIER)', STYLE_SIG_LABEL)]
-    sig_right = [Paragraph('<b>ISSUED BY :</b><br/>Wilson Group Holdings Limited', STYLE_SIG_LABEL),
-                 Spacer(1, 20), Paragraph('_' * 40, STYLE_SIG_LINE), Spacer(1, 2),
-                 Paragraph('AUTHORIZED SIGNATURE', STYLE_SIG_LABEL)]
-    sig_table = Table([[sig_left, sig_right]], colWidths=[CONTENT_W * 0.5, CONTENT_W * 0.5])
+    SIG_LINE_W = CONTENT_W * 0.42
+    def _sig_line():
+        return HRFlowable(width=SIG_LINE_W, thickness=0.75, color=colors.black, hAlign='LEFT')
+    sig_table_data = [
+        ['', Paragraph('<b>ISSUED BY :</b><br/>Wilson Group Holdings Limited', STYLE_SIG_LABEL)],
+        [_sig_line(), _sig_line()],
+        [Paragraph('ACCEPTED BY (SUPPLIER)', STYLE_SIG_LABEL), Paragraph('AUTHORIZED SIGNATURE', STYLE_SIG_LABEL)],
+    ]
+    sig_table = Table(sig_table_data, colWidths=[CONTENT_W * 0.5, CONTENT_W * 0.5])
     sig_table.setStyle(TableStyle([
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
-        ('TOPPADDING', (0, 0), (-1, -1), 60),
+        ('TOPPADDING', (0, 0), (-1, -1), 0),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+        ('TOPPADDING', (0, 0), (-1, 0), 60),
+        ('TOPPADDING', (0, 1), (-1, 1), 14),
+        ('BOTTOMPADDING', (0, 1), (-1, 1), 2),
     ]))
     story.append(sig_table)
     story.append(Spacer(1, 40))
