@@ -22,6 +22,17 @@ from reportlab.platypus import (
     BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer, Table, TableStyle,
     PageBreak, HRFlowable
 )
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont, CIDEncoding
+
+# 繁體中文(TUMI 顏色欄常見中英混合,如「槍色」「淺金」)。
+# reportlab 內建的 defaultUnicodeEncodings 把 MSung-Light(繁體 Adobe-CNS1 字集)
+# 誤配到 'UniGB-UCS2-H'(簡體 Adobe-GB1 的 CMap),會讓繁體字元對應到錯誤的字形、印出亂碼。
+# 手動修正成正確的 'UniCNS-UCS2-H' CMap 才能正常顯示。
+_cjk_font = UnicodeCIDFont('MSung-Light')
+_cjk_font.encodingName = 'UniCNS-UCS2-H'
+_cjk_font.encoding = CIDEncoding('UniCNS-UCS2-H')
+pdfmetrics.registerFont(_cjk_font)
 from reportlab.pdfgen import canvas as canvas_mod
 
 # ========================================================================
@@ -34,10 +45,6 @@ SUPPLIER_BLOCK = [
     'WILSON LEATHER (CAMBODIA) CO.,LTD',
     'THLORK VILLAGE, TROPAING KONG COMMUNE, SAMRONG',
     'TONG DISTRICT, KAMPONG SPEU PROVINCE, CAMBODIA.',
-]
-CONSIGNEE_LINES = [
-    'JRSK, Inc dbc Away',
-    '503 Broadway, 3rd Floor, New York, NY, 10012, United States',
 ]
 PAYMENT_TERM = 'Net 45 days EOM'
 TERMS = [
@@ -89,7 +96,7 @@ def fmt_date(dt):
 # ========================================================================
 # Excel 欄位辨識(用關鍵字比對表頭,不依賴固定欄位順序,同一份總表換月份 Sheet 也能用)
 # ========================================================================
-COLUMN_KEYWORDS = {
+AWAY_COLUMN_KEYWORDS = {
     'factory_po': ['factory number'],
     'customer_po': ['客人po'],
     'order_date': ['下單日期'],
@@ -101,7 +108,7 @@ COLUMN_KEYWORDS = {
     'price': ['price單價'],
     'xf_date': ['po出貨日期'],
 }
-COLUMN_LABELS = {
+AWAY_COLUMN_LABELS = {
     'factory_po': 'Factory number訂單編號',
     'customer_po': '客人po#',
     'order_date': '下單日期',
@@ -114,19 +121,86 @@ COLUMN_LABELS = {
     'xf_date': 'PO出貨日期',
 }
 
-def find_column_map(ws, header_row=1):
+# TUMI 表頭全中文,且「分出货地」是合併儲存格橫跨兩欄(數量+目的地名),
+# 目的地名那一欄本身沒有獨立表頭文字,所以不放進關鍵字比對,改用 find_merged_pair_columns() 動態抓。
+TUMI_COLUMN_KEYWORDS = {
+    'factory_po': ['訂單編號'],
+    'customer_po': ['客人po'],
+    'order_date': ['下單日期'],
+    'product_code': ['開發款號'],
+    'description': ['描述'],
+    'color_en': ['顏色'],
+    'price': ['單價'],
+    'xf_date': ['出貨日期'],
+}
+TUMI_COLUMN_LABELS = {
+    'factory_po': '訂單編號',
+    'customer_po': '客人po#',
+    'order_date': '下單日期',
+    'product_code': '開發款號',
+    'description': '描述',
+    'color_en': '顏色',
+    'balance_qty': '分出货地(數量欄)',
+    'destination': '分出货地(目的地欄)',
+    'price': '單價',
+    'xf_date': '出貨日期',
+}
+
+BRANDS = {
+    'AWAY': {
+        'column_keywords': AWAY_COLUMN_KEYWORDS,
+        'column_labels': AWAY_COLUMN_LABELS,
+        'merged_dest_header': None,
+        'consignee_lines': [
+            'JRSK, Inc dbc Away',
+            '503 Broadway, 3rd Floor, New York, NY, 10012, United States',
+        ],
+        'po_no_label': 'AWAY PO NO',
+        'price_multiplier': 0.88,
+        'price_decimals': 4,
+    },
+    'TUMI': {
+        'column_keywords': TUMI_COLUMN_KEYWORDS,
+        'column_labels': TUMI_COLUMN_LABELS,
+        'merged_dest_header': '分出货地',
+        'consignee_lines': [
+            'TUMI, INC.',
+            '2501 MATTHEWS INDUSTRIAL CIRCLE, SUITE #1 VIDALIA, GA 30474, U.S.A.',
+        ],
+        'po_no_label': 'TUMI PO NO',
+        'price_multiplier': 1.0,
+        'price_decimals': 2,
+    },
+}
+
+def find_merged_pair_columns(ws, header_text, header_row=1):
+    """找出表頭文字為 header_text 的合併儲存格範圍,回傳 (第一欄, 第二欄)。
+    用於「一個表頭橫跨兩個實際資料欄」的情況(例如 TUMI 的「分出货地」= 數量+目的地名)。"""
+    target = header_text.strip().lower()
+    for mc in ws.merged_cells.ranges:
+        if mc.min_row <= header_row <= mc.max_row and mc.max_col == mc.min_col + 1:
+            v = ws.cell(row=header_row, column=mc.min_col).value
+            if v and str(v).strip().lower() == target:
+                return mc.min_col, mc.min_col + 1
+    return None
+
+def find_column_map(ws, column_keywords, column_labels, merged_dest_header=None, header_row=1):
     headers = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row=header_row, column=c).value
         if v:
             headers[c] = str(v).strip().lower()
     colmap = {}
-    for key, keywords in COLUMN_KEYWORDS.items():
+    for key, keywords in column_keywords.items():
         for c, h in headers.items():
             if all(kw.lower() in h for kw in keywords):
                 colmap[key] = c
                 break
-    missing = [COLUMN_LABELS[k] for k in COLUMN_KEYWORDS if k not in colmap]
+    if merged_dest_header:
+        pair = find_merged_pair_columns(ws, merged_dest_header, header_row)
+        if pair:
+            colmap['balance_qty'], colmap['destination'] = pair
+    missing = [column_labels[k] for k in column_labels if k not in colmap]
     return colmap, missing
 
 def scan_destinations(ws, colmap, data_start_row=3):
@@ -138,7 +212,7 @@ def scan_destinations(ws, colmap, data_start_row=3):
             vals.add(str(v).strip())
     return sorted(vals)
 
-def extract_groups(ws, colmap, selected_destinations, data_start_row=3):
+def extract_groups(ws, colmap, selected_destinations, price_multiplier=1.0, price_decimals=4, data_start_row=3):
     """回傳 { (factory_po, customer_po, dest): [row_dict, ...] }。
     Balance qty <= 0 或缺單價的品項列會直接排除;整組都被排除的組別不會出現在結果裡。"""
     def g(r, key):
@@ -156,7 +230,7 @@ def extract_groups(ws, colmap, selected_destinations, data_start_row=3):
         price = g(r, 'price')
         if not qty or qty <= 0 or price is None:
             continue
-        price = round(price * 0.88, 4)
+        price = round(price * price_multiplier, price_decimals)
         f = g(r, 'factory_po')
         c = g(r, 'customer_po')
         if not f or not c:
@@ -183,8 +257,18 @@ STYLE_INFO_RIGHT = ParagraphStyle('infoR', fontName='Helvetica', fontSize=10.5, 
 STYLE_TH = ParagraphStyle('th', fontName='Helvetica-Bold', fontSize=10, alignment=TA_LEFT)
 STYLE_TH_R = ParagraphStyle('thr', fontName='Helvetica-Bold', fontSize=10, alignment=TA_RIGHT)
 STYLE_TD = ParagraphStyle('td', fontName='Helvetica', fontSize=10.5, alignment=TA_LEFT)
+STYLE_TD_CJK = ParagraphStyle('td_cjk', fontName='MSung-Light', fontSize=10.5, alignment=TA_LEFT)
 STYLE_TD_R = ParagraphStyle('tdr', fontName='Helvetica', fontSize=10.5, alignment=TA_RIGHT)
 STYLE_TD_BOLD = ParagraphStyle('tdb', fontName='Helvetica-Bold', fontSize=10.5, alignment=TA_LEFT)
+STYLE_TD_BOLD_CJK = ParagraphStyle('tdb_cjk', fontName='MSung-Light', fontSize=10.5, alignment=TA_LEFT)
+
+
+def _has_cjk(text):
+    return any('一' <= ch <= '鿿' for ch in str(text))
+
+
+def _cell_paragraph(text, plain_style, cjk_style):
+    return Paragraph(str(text), cjk_style if _has_cjk(text) else plain_style)
 STYLE_TOTAL = ParagraphStyle('total', fontName='Helvetica-Bold', fontSize=10.5, alignment=TA_LEFT)
 STYLE_TOTAL_R = ParagraphStyle('totalr', fontName='Helvetica-Bold', fontSize=10.5, alignment=TA_RIGHT)
 STYLE_BODY = ParagraphStyle('body', fontName='Helvetica', fontSize=10.5, alignment=TA_LEFT, leading=15)
@@ -199,7 +283,8 @@ MARGIN_BOTTOM = 16 * mm
 CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
 
 
-def _build_header_flowables(po_no, away_po_no, po_date_str, xf_date_str, page_str):
+def _build_header_flowables(po_no, away_po_no, po_date_str, xf_date_str, page_str,
+                             consignee_lines, po_no_label):
     left_w = CONTENT_W * 0.60
     right_w = CONTENT_W * 0.38
 
@@ -228,13 +313,13 @@ def _build_header_flowables(po_no, away_po_no, po_date_str, xf_date_str, page_st
     left2 = Paragraph(
         f"<b>PO NO :</b> {po_no}<br/>"
         f"<b>REF. SUPPLIER S/C NO :</b> {po_no}<br/>"
-        f"<b>ULTIMATE CONSIGNEE :</b> {CONSIGNEE_LINES[0]}<br/>"
-        + '<br/>'.join(CONSIGNEE_LINES[1:]),
+        f"<b>ULTIMATE CONSIGNEE :</b> {consignee_lines[0]}<br/>"
+        + '<br/>'.join(consignee_lines[1:]),
         STYLE_INFO_LEFT)
     right2 = Paragraph(
         f"<b>XF-DATE :</b> {xf_date_str}<br/>"
         f"<b>PAYMENT TERM :</b> {PAYMENT_TERM}<br/>"
-        f"<b>AWAY PO NO :</b> {away_po_no}",
+        f"<b>{po_no_label} :</b> {away_po_no}",
         STYLE_INFO_RIGHT)
     t2 = Table([[left2, right2]], colWidths=[left_w, right_w])
     t2.setStyle(TableStyle([
@@ -248,12 +333,13 @@ def _build_header_flowables(po_no, away_po_no, po_date_str, xf_date_str, page_st
     return flow
 
 
-def _header_height_estimate():
+def _header_height_estimate(consignee_lines, po_no_label):
     """實際跑一次 Frame 排版量出 header 高度(比直接加總 wrap() 準,
     因為 Frame 還會另外加上每個 flowable 的 spaceBefore/spaceAfter)。"""
     buf = io.BytesIO()
     dummy_canvas = canvas_mod.Canvas(buf, pagesize=A4)
-    flow = _build_header_flowables('AWC-0000/26', 'POUS0000000', '2026/1/1', '2026/1/1', '1 / 9')
+    flow = _build_header_flowables('AWC-0000/26', 'POUS0000000', '2026/1/1', '2026/1/1', '1 / 9',
+                                    consignee_lines, po_no_label)
     top_y = PAGE_H - MARGIN_TOP
     frame = Frame(MARGIN_L, 0, CONTENT_W, top_y,
                   leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, showBoundary=0)
@@ -263,7 +349,7 @@ def _header_height_estimate():
     return consumed + 6
 
 
-def _build_item_story(groups_items):
+def _build_item_story(groups_items, price_decimals=4):
     col_w = [CONTENT_W * 0.19, CONTENT_W * 0.29, CONTENT_W * 0.16, CONTENT_W * 0.16, CONTENT_W * 0.20]
     table_data = [[
         Paragraph('ITEM NO.', STYLE_TH), Paragraph('DESCRIPTION', STYLE_TH),
@@ -284,7 +370,8 @@ def _build_item_story(groups_items):
     total_amount = 0.0
     row_idx = 1
     for (code, desc), colors_list in groups_items.items():
-        table_data.append([Paragraph(code, STYLE_TD_BOLD), Paragraph(desc, STYLE_TD_BOLD), '', '', ''])
+        table_data.append([_cell_paragraph(code, STYLE_TD_BOLD, STYLE_TD_BOLD_CJK),
+                            _cell_paragraph(desc, STYLE_TD_BOLD, STYLE_TD_BOLD_CJK), '', '', ''])
         style_cmds.append(('TOPPADDING', (0, row_idx), (-1, row_idx), 7))
         row_idx += 1
         for color, qty, price in colors_list:
@@ -292,9 +379,9 @@ def _build_item_story(groups_items):
             total_qty += qty
             total_amount += amount
             table_data.append([
-                '', Paragraph(color, STYLE_TD),
+                '', _cell_paragraph(color, STYLE_TD, STYLE_TD_CJK),
                 Paragraph(f'{qty:,} PCS', STYLE_TD_R),
-                Paragraph(f'{price:.4f}', STYLE_TD_R),
+                Paragraph(f'{price:.{price_decimals}f}', STYLE_TD_R),
                 Paragraph(f'{amount:,.2f}', STYLE_TD_R),
             ])
             row_idx += 1
@@ -343,19 +430,21 @@ def _build_item_story(groups_items):
     return story, total_qty, total_amount, say_total
 
 
-def build_po_pdf(out_path, po_no, away_po_no, po_date_str, xf_date_str, groups_items):
+def build_po_pdf(out_path, po_no, away_po_no, po_date_str, xf_date_str, groups_items,
+                  consignee_lines, po_no_label, price_decimals=4):
     """groups_items: dict{(code,desc): [(color, qty, price), ...]}(用一般 dict 保序即可)。
     兩階段輸出:先算總頁數,再正式輸出,讓「Page : X / Y」永遠正確。"""
-    header_h = _header_height_estimate()
+    header_h = _header_height_estimate(consignee_lines, po_no_label)
     main_h = PAGE_H - MARGIN_TOP - MARGIN_BOTTOM - header_h - 4
 
     def make_doc(path, page_str_fn):
-        story, total_qty, total_amount, say_total = _build_item_story(groups_items)
+        story, total_qty, total_amount, say_total = _build_item_story(groups_items, price_decimals)
 
         def on_page(c, doc):
             c.saveState()
             page_str = page_str_fn(doc.page)
-            header_flow = _build_header_flowables(po_no, away_po_no, po_date_str, xf_date_str, page_str)
+            header_flow = _build_header_flowables(po_no, away_po_no, po_date_str, xf_date_str, page_str,
+                                                   consignee_lines, po_no_label)
             frame = Frame(MARGIN_L, PAGE_H - MARGIN_TOP - header_h, CONTENT_W, header_h,
                           leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0, showBoundary=0)
             frame.addFromList(list(header_flow), c)
@@ -385,17 +474,19 @@ def build_po_pdf(out_path, po_no, away_po_no, po_date_str, xf_date_str, groups_i
 # ========================================================================
 # 主流程:讀 Excel -> 分組 -> 逐組出 PDF
 # ========================================================================
-def generate_all(excel_path, sheet_name, selected_destinations, out_dir, log):
+def generate_all(excel_path, sheet_name, selected_destinations, out_dir, log, brand='AWAY'):
+    cfg = BRANDS[brand]
     wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb[sheet_name]
-    colmap, missing = find_column_map(ws)
+    colmap, missing = find_column_map(ws, cfg['column_keywords'], cfg['column_labels'], cfg['merged_dest_header'])
     if missing:
         log('❌ 這個 Sheet 缺少必要欄位,無法產生:')
         for m in missing:
             log(f'   - {m}')
         return
 
-    raw_groups = extract_groups(ws, colmap, selected_destinations)
+    raw_groups = extract_groups(ws, colmap, selected_destinations,
+                                 cfg['price_multiplier'], cfg['price_decimals'])
     if not raw_groups:
         log('⚠️ 篩選後沒有任何資料(可能勾選的 Destination 都沒有 Balance qty > 0 的品項)')
         return
@@ -421,7 +512,8 @@ def generate_all(excel_path, sheet_name, selected_destinations, out_dir, log):
         out_path = os.path.join(out_dir, fname)
 
         try:
-            qty, amount, say = build_po_pdf(out_path, po_no, away_po_no, po_date_str, xf_date_str, items)
+            qty, amount, say = build_po_pdf(out_path, po_no, away_po_no, po_date_str, xf_date_str, items,
+                                             cfg['consignee_lines'], cfg['po_no_label'], cfg['price_decimals'])
             log(f'✅ {fname}  —  {qty:,} PCS / USD {amount:,.2f}')
             ok += 1
         except Exception as e:
@@ -435,33 +527,41 @@ def generate_all(excel_path, sheet_name, selected_destinations, out_dir, log):
 # ========================================================================
 class App:
     def __init__(self, root):
-        root.title('AWAY PO 產生工具 v1')
-        root.geometry('720x640')
+        root.title('PO 產生工具 v2')
+        root.geometry('720x680')
 
         pad = {'padx': 10, 'pady': 6}
 
         self.v_excel = tk.StringVar()
         self.v_sheet = tk.StringVar()
         self.v_out = tk.StringVar()
+        self.v_brand = tk.StringVar(value='AWAY')
         self.dest_vars = {}   # {dest_value: tk.BooleanVar}
         self.colmap = None
         self.ws = None
 
+        # -- 品牌 --
+        tk.Label(root, text='品牌:', anchor='w', width=12).grid(row=0, column=0, **pad, sticky='w')
+        brand_combo = ttk.Combobox(root, textvariable=self.v_brand, width=15, state='readonly',
+                                    values=list(BRANDS.keys()))
+        brand_combo.grid(row=0, column=1, **pad, sticky='w')
+        brand_combo.bind('<<ComboboxSelected>>', lambda e: self.on_sheet_selected())
+
         # -- Excel 檔案 --
-        tk.Label(root, text='Excel 檔案:', anchor='w', width=12).grid(row=0, column=0, **pad, sticky='w')
-        tk.Entry(root, textvariable=self.v_excel, width=52).grid(row=0, column=1, **pad)
-        tk.Button(root, text='選擇', width=8, command=self.browse_excel).grid(row=0, column=2, padx=(0, 10))
+        tk.Label(root, text='Excel 檔案:', anchor='w', width=12).grid(row=1, column=0, **pad, sticky='w')
+        tk.Entry(root, textvariable=self.v_excel, width=52).grid(row=1, column=1, **pad)
+        tk.Button(root, text='選擇', width=8, command=self.browse_excel).grid(row=1, column=2, padx=(0, 10))
 
         # -- Sheet 選擇 --
-        tk.Label(root, text='Sheet:', anchor='w', width=12).grid(row=1, column=0, **pad, sticky='w')
+        tk.Label(root, text='Sheet:', anchor='w', width=12).grid(row=2, column=0, **pad, sticky='w')
         self.sheet_combo = ttk.Combobox(root, textvariable=self.v_sheet, width=50, state='readonly')
-        self.sheet_combo.grid(row=1, column=1, **pad, sticky='w')
+        self.sheet_combo.grid(row=2, column=1, **pad, sticky='w')
         self.sheet_combo.bind('<<ComboboxSelected>>', lambda e: self.on_sheet_selected())
 
         # -- Destination 勾選區(動態產生)--
-        tk.Label(root, text='Destination\n(出貨地):', anchor='nw', width=12, justify='left').grid(row=2, column=0, **pad, sticky='nw')
+        tk.Label(root, text='Destination\n(出貨地):', anchor='nw', width=12, justify='left').grid(row=3, column=0, **pad, sticky='nw')
         dest_outer = tk.Frame(root, bd=1, relief='sunken')
-        dest_outer.grid(row=2, column=1, columnspan=2, padx=10, pady=6, sticky='we')
+        dest_outer.grid(row=3, column=1, columnspan=2, padx=10, pady=6, sticky='we')
         self.dest_canvas = tk.Canvas(dest_outer, height=140, width=560)
         dest_scroll = tk.Scrollbar(dest_outer, orient='vertical', command=self.dest_canvas.yview)
         self.dest_frame = tk.Frame(self.dest_canvas)
@@ -472,18 +572,18 @@ class App:
         dest_scroll.pack(side='right', fill='y')
 
         # -- 輸出資料夾 --
-        tk.Label(root, text='輸出資料夾:', anchor='w', width=12).grid(row=3, column=0, **pad, sticky='w')
-        tk.Entry(root, textvariable=self.v_out, width=52).grid(row=3, column=1, **pad)
-        tk.Button(root, text='選擇', width=8, command=self.browse_folder).grid(row=3, column=2, padx=(0, 10))
+        tk.Label(root, text='輸出資料夾:', anchor='w', width=12).grid(row=4, column=0, **pad, sticky='w')
+        tk.Entry(root, textvariable=self.v_out, width=52).grid(row=4, column=1, **pad)
+        tk.Button(root, text='選擇', width=8, command=self.browse_folder).grid(row=4, column=2, padx=(0, 10))
 
         # -- 執行按鈕 --
         self.btn = tk.Button(root, text='▶  產生 PDF', font=('Arial', 13, 'bold'),
                               bg='#2e86de', fg='white', width=14, command=self.execute)
-        self.btn.grid(row=4, column=0, columnspan=3, pady=12)
+        self.btn.grid(row=5, column=0, columnspan=3, pady=12)
 
         # -- Log --
         self.log_box = tk.Text(root, height=18, width=86, state='disabled', bg='#f0f0f0', font=('Courier', 10))
-        self.log_box.grid(row=5, column=0, columnspan=3, padx=10, pady=(0, 10))
+        self.log_box.grid(row=6, column=0, columnspan=3, padx=10, pady=(0, 10))
 
     # ---- helpers ----
     def browse_excel(self):
@@ -514,9 +614,10 @@ class App:
             w.destroy()
         self.dest_vars = {}
         try:
+            cfg = BRANDS[self.v_brand.get()]
             wb = openpyxl.load_workbook(excel_path, data_only=True)
             ws = wb[sheet_name]
-            colmap, missing = find_column_map(ws)
+            colmap, missing = find_column_map(ws, cfg['column_keywords'], cfg['column_labels'], cfg['merged_dest_header'])
             if missing:
                 tk.Label(self.dest_frame, fg='red',
                          text='這個 Sheet 缺少必要欄位:\n' + '\n'.join(missing),
@@ -541,6 +642,7 @@ class App:
         excel_path = self.v_excel.get().strip()
         sheet_name = self.v_sheet.get().strip()
         out_dir = self.v_out.get().strip()
+        brand = self.v_brand.get()
         selected = [d for d, v in self.dest_vars.items() if v.get()]
 
         if not excel_path or not sheet_name:
@@ -560,7 +662,7 @@ class App:
 
         def task():
             try:
-                generate_all(excel_path, sheet_name, selected, out_dir, self.log)
+                generate_all(excel_path, sheet_name, selected, out_dir, self.log, brand)
             except Exception as e:
                 self.log(f'❌ 發生錯誤: {e}')
             self.btn.config(state='normal', text='▶  產生 PDF')
