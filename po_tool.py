@@ -650,7 +650,7 @@ class App:
 
     def on_sheet_selected(self):
         excel_path = self.v_excel.get().strip()
-        sheet_name = self.v_sheet.get().strip()
+        sheet_name = self.v_sheet.get()  # 不 strip:有些 Sheet 名稱本身含頭尾空白(例如「柬埔寨9月26  」),strip 會對不到真正的分頁名稱
         if not excel_path or not sheet_name:
             return
         self._clear_dest_frame('讀取中,請稍候...')
@@ -693,7 +693,7 @@ class App:
 
     def execute(self):
         excel_path = self.v_excel.get().strip()
-        sheet_name = self.v_sheet.get().strip()
+        sheet_name = self.v_sheet.get()  # 不 strip,理由同 on_sheet_selected()
         out_dir = self.v_out.get().strip()
         brand = self.v_brand.get()
         selected = [d for d, v in self.dest_vars.items() if v.get()]
