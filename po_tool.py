@@ -474,9 +474,12 @@ def build_po_pdf(out_path, po_no, away_po_no, po_date_str, xf_date_str, groups_i
 # ========================================================================
 # 主流程:讀 Excel -> 分組 -> 逐組出 PDF
 # ========================================================================
-def generate_all(excel_path, sheet_name, selected_destinations, out_dir, log, brand='AWAY'):
+def generate_all(excel_path, sheet_name, selected_destinations, out_dir, log, brand='AWAY', wb=None):
+    """wb 可傳入已經開好的 openpyxl Workbook(GUI 用快取避免重複讀取大檔案);
+    不傳的話(例如獨立跑腳本)就照 excel_path 自己讀一次。"""
     cfg = BRANDS[brand]
-    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    if wb is None:
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
     ws = wb[sheet_name]
     colmap, missing = find_column_map(ws, cfg['column_keywords'], cfg['column_labels'], cfg['merged_dest_header'])
     if missing:
@@ -529,6 +532,7 @@ class App:
     def __init__(self, root):
         root.title('PO 產生工具 v2')
         root.geometry('720x680')
+        self.root = root
 
         pad = {'padx': 10, 'pady': 6}
 
@@ -537,8 +541,8 @@ class App:
         self.v_out = tk.StringVar()
         self.v_brand = tk.StringVar(value='AWAY')
         self.dest_vars = {}   # {dest_value: tk.BooleanVar}
-        self.colmap = None
-        self.ws = None
+        self.wb = None        # 快取已讀取的 openpyxl Workbook,避免大檔案重複讀取
+        self.wb_path = None
 
         # -- 品牌 --
         tk.Label(root, text='品牌:', anchor='w', width=12).grid(row=0, column=0, **pad, sticky='w')
@@ -586,19 +590,58 @@ class App:
         self.log_box.grid(row=6, column=0, columnspan=3, padx=10, pady=(0, 10))
 
     # ---- helpers ----
+    def _run_bg(self, work_fn, done_fn):
+        """在背景執行緒跑 work_fn(可能很慢的 I/O),完成後把結果丟回主執行緒跑 done_fn(Tk 元件只能在主執行緒動)。"""
+        def task():
+            try:
+                result = work_fn()
+            except Exception as e:
+                result = e
+            self.root.after(0, lambda: done_fn(result))
+        threading.Thread(target=task, daemon=True).start()
+
+    def _get_workbook(self, path):
+        """讀取 Excel 並快取;同一個檔案路徑只從硬碟讀一次,之後切 Sheet/切品牌都直接重用記憶體裡的版本。"""
+        if self.wb_path == path and self.wb is not None:
+            return self.wb
+        wb = openpyxl.load_workbook(path, data_only=True)
+        self.wb_path = path
+        self.wb = wb
+        return wb
+
+    def _clear_dest_frame(self, msg=''):
+        for w in self.dest_frame.winfo_children():
+            w.destroy()
+        self.dest_vars = {}
+        if msg:
+            tk.Label(self.dest_frame, text=msg, fg='#555').pack(anchor='w')
+
     def browse_excel(self):
         path = filedialog.askopenfilename(filetypes=[('Excel', '*.xlsx')])
         if not path:
             return
         self.v_excel.set(path)
-        try:
-            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        self.sheet_combo.set('')
+        self.sheet_combo['values'] = []
+        self._clear_dest_frame('讀取中,請稍候...(檔案較大或 Sheet 較多第一次讀取可能要幾秒)')
+
+        def work():
+            return self._get_workbook(path)
+
+        def done(result):
+            if isinstance(result, Exception):
+                messagebox.showerror('讀取失敗', str(result))
+                self._clear_dest_frame('')
+                return
+            wb = result
             self.sheet_combo['values'] = wb.sheetnames
             if wb.sheetnames:
                 self.v_sheet.set(wb.sheetnames[0])
                 self.on_sheet_selected()
-        except Exception as e:
-            messagebox.showerror('讀取失敗', str(e))
+            else:
+                self._clear_dest_frame('')
+
+        self._run_bg(work, done)
 
     def browse_folder(self):
         path = filedialog.askdirectory()
@@ -610,26 +653,36 @@ class App:
         sheet_name = self.v_sheet.get().strip()
         if not excel_path or not sheet_name:
             return
-        for w in self.dest_frame.winfo_children():
-            w.destroy()
-        self.dest_vars = {}
-        try:
-            cfg = BRANDS[self.v_brand.get()]
-            wb = openpyxl.load_workbook(excel_path, data_only=True)
+        self._clear_dest_frame('讀取中,請稍候...')
+        brand = self.v_brand.get()
+
+        def work():
+            wb = self._get_workbook(excel_path)
             ws = wb[sheet_name]
+            cfg = BRANDS[brand]
             colmap, missing = find_column_map(ws, cfg['column_keywords'], cfg['column_labels'], cfg['merged_dest_header'])
             if missing:
+                return ('missing', missing)
+            return ('ok', scan_destinations(ws, colmap))
+
+        def done(result):
+            if isinstance(result, Exception):
+                messagebox.showerror('讀取 Sheet 失敗', str(result))
+                self._clear_dest_frame('')
+                return
+            kind, payload = result
+            self._clear_dest_frame()
+            if kind == 'missing':
                 tk.Label(self.dest_frame, fg='red',
-                         text='這個 Sheet 缺少必要欄位:\n' + '\n'.join(missing),
+                         text='這個 Sheet 缺少必要欄位:\n' + '\n'.join(payload),
                          justify='left').pack(anchor='w')
                 return
-            dests = scan_destinations(ws, colmap)
-            for d in dests:
+            for d in payload:
                 var = tk.BooleanVar(value=False)
                 self.dest_vars[d] = var
                 tk.Checkbutton(self.dest_frame, text=d, variable=var).pack(anchor='w')
-        except Exception as e:
-            messagebox.showerror('讀取 Sheet 失敗', str(e))
+
+        self._run_bg(work, done)
 
     def log(self, msg):
         self.log_box.config(state='normal')
@@ -662,7 +715,8 @@ class App:
 
         def task():
             try:
-                generate_all(excel_path, sheet_name, selected, out_dir, self.log, brand)
+                wb = self._get_workbook(excel_path)
+                generate_all(excel_path, sheet_name, selected, out_dir, self.log, brand, wb=wb)
             except Exception as e:
                 self.log(f'❌ 發生錯誤: {e}')
             self.btn.config(state='normal', text='▶  產生 PDF')
